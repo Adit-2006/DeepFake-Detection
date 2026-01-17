@@ -1,5 +1,8 @@
 # src/train_streamed.py
-# GPU-optimized streamed training WITH FPS = 12 sampling
+# GPU-optimized streamed training WITH FPS = 12
+# Tier-2 optimizations applied:
+# 1) Reduced input resolution
+# 2) Frozen backbone (train classifier head only)
 
 import os
 import cv2
@@ -15,31 +18,44 @@ DATA_DIR = "data/videos"     # data/videos/real and data/videos/fake (recursive)
 EPOCHS = 2
 LR = 1e-4
 BATCH_SIZE = 16
-FPS = 12                    # <-- TRAINING FPS SET HERE
+FPS = 12                    # training FPS
 MODEL_PATH = "models/image_model.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+INPUT_SIZE = 160            # Tier-2: smaller resolution
 # ---------------------------------------
 
 print(f"Training on device: {DEVICE}")
 
-# Speedups
+# ---------------- SPEEDUPS ----------------
 torch.backends.cudnn.benchmark = True
 cv2.setNumThreads(0)
+torch.set_num_threads(os.cpu_count())
+# ------------------------------------------
 
-# Preprocessing
+# ---------------- PREPROCESS ----------------
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
     transforms.ToTensor()
 ])
 
-# Model
+# ---------------- MODEL ----------------
 model = resnet18(weights="IMAGENET1K_V1")
+
+# Tier-2: freeze backbone
+for param in model.parameters():
+    param.requires_grad = False
+
+# Train only classifier head
 model.fc = nn.Linear(model.fc.in_features, 2)
+for param in model.fc.parameters():
+    param.requires_grad = True
+
 model.to(DEVICE)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+optimizer = torch.optim.Adam(model.fc.parameters(), lr=LR)
 scaler = GradScaler()
+# --------------------------------------
 
 
 def train_on_video(video_path: str, label: int):
@@ -50,7 +66,6 @@ def train_on_video(video_path: str, label: int):
 
     frames = []
     labels = []
-
     frame_id = 0
 
     while True:
@@ -59,12 +74,17 @@ def train_on_video(video_path: str, label: int):
             break
 
         if frame_id % interval == 0:
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frames.append(transform(img))
-            labels.append(label)
+            with torch.no_grad():
+                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                frames.append(transform(img))
+                labels.append(label)
 
             if len(frames) == BATCH_SIZE:
-                x = torch.stack(frames).to(DEVICE, non_blocking=True)
+                x = (
+                    torch.stack(frames)
+                    .pin_memory()
+                    .to(DEVICE, non_blocking=True)
+                )
                 y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
 
                 optimizer.zero_grad()
@@ -83,7 +103,11 @@ def train_on_video(video_path: str, label: int):
 
     # Train on remaining frames
     if frames:
-        x = torch.stack(frames).to(DEVICE, non_blocking=True)
+        x = (
+            torch.stack(frames)
+            .pin_memory()
+            .to(DEVICE, non_blocking=True)
+        )
         y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
 
         optimizer.zero_grad()
