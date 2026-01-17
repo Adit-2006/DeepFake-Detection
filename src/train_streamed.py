@@ -1,5 +1,5 @@
 # src/train_streamed.py
-# GPU-optimized streamed training (safe + fast)
+# GPU-optimized streamed training WITHOUT FPS limits (process every frame)
 
 import os
 import cv2
@@ -11,29 +11,27 @@ from PIL import Image
 from torch.cuda.amp import autocast, GradScaler
 
 # ---------------- CONFIG ----------------
-DATA_DIR = "data/videos"     # expects data/videos/real and data/videos/fake (any depth)
-FPS = 5                    # lower FPS = faster, still effective
+DATA_DIR = "data/videos"     # data/videos/real and data/videos/fake (recursive)
 EPOCHS = 2
 LR = 1e-4
-BATCH_SIZE = 16              # GPU utilization
-MAX_FRAMES_PER_VIDEO = 400   # safety cap
+BATCH_SIZE = 16
 MODEL_PATH = "models/image_model.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------------------
 
 print(f"Training on device: {DEVICE}")
 
-# --------- GPU SPEEDUPS ----------
+# Speedups
 torch.backends.cudnn.benchmark = True
 cv2.setNumThreads(0)
-# --------------------------------
 
+# Preprocessing
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor()
 ])
 
-# ---------------- Model ----------------
+# Model
 model = resnet18(weights="IMAGENET1K_V1")
 model.fc = nn.Linear(model.fc.in_features, 2)
 model.to(DEVICE)
@@ -42,50 +40,37 @@ criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 scaler = GradScaler()
 
-# -------------------------------------
 
 def train_on_video(video_path: str, label: int):
     cap = cv2.VideoCapture(video_path)
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    interval = max(int(video_fps // FPS), 1)
 
     frames = []
     labels = []
-
-    frame_id = 0
-    used = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_id % interval == 0:
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frames.append(transform(img))
-            labels.append(label)
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        frames.append(transform(img))
+        labels.append(label)
 
-            if len(frames) == BATCH_SIZE:
-                x = torch.stack(frames).to(DEVICE, non_blocking=True)
-                y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
+        if len(frames) == BATCH_SIZE:
+            x = torch.stack(frames).to(DEVICE, non_blocking=True)
+            y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
 
-                optimizer.zero_grad()
-                with autocast():
-                    out = model(x)
-                    loss = criterion(out, y)
+            optimizer.zero_grad()
+            with autocast():
+                out = model(x)
+                loss = criterion(out, y)
 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-                frames.clear()
-                labels.clear()
-
-                used += BATCH_SIZE
-                if used >= MAX_FRAMES_PER_VIDEO:
-                    break
-
-        frame_id += 1
+            frames.clear()
+            labels.clear()
 
     # Train on remaining frames
     if frames:
