@@ -1,10 +1,4 @@
 # src/train_streamed.py
-# FINAL PATCHED VERSION
-# - Training FPS = 12
-# - GPU optimized (AMP, cuDNN, pinned memory)
-# - Tier-2 optimizations (smaller input, frozen backbone)
-# - Edge-case handling
-# - Ctrl+C safe checkpoint saving
 
 import os
 import cv2
@@ -16,7 +10,8 @@ from PIL import Image
 from torch.cuda.amp import autocast, GradScaler
 
 # ---------------- CONFIG ----------------
-DATA_DIR = "data/"     # data/videos/ and data/images/ (recursive)
+VIDEO_DIR = "data/videos"    # data/videos/real, data/videos/fake
+IMAGE_DIR = "data/images"    # data/images/real, data/images/fake
 EPOCHS = 5
 LR = 5e-5
 BATCH_SIZE = 16
@@ -26,19 +21,11 @@ MODEL_PATH = "models/image_model.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------------------
 
-# ---------------- STATS ----------------
-REAL_COUNT = 0
-FAKE_COUNT = 0
-# --------------------------------------
-
-
 print(f"Training on device: {DEVICE}")
 
-# ---------------- SPEEDUPS ----------------
 torch.backends.cudnn.benchmark = True
 cv2.setNumThreads(0)
 torch.set_num_threads(os.cpu_count())
-# ----------------------------------------
 
 # ---------------- PREPROCESS ----------------
 transform = transforms.Compose([
@@ -50,16 +37,16 @@ transform = transforms.Compose([
 model = resnet18(weights="IMAGENET1K_V1")
 
 # Freeze backbone
-for param in model.parameters():
-    param.requires_grad = False
+for p in model.parameters():
+    p.requires_grad = False
 
-# Train classifier head + last block (better quality)
-for param in model.layer4.parameters():
-    param.requires_grad = True
+# Unfreeze last block + classifier
+for p in model.layer4.parameters():
+    p.requires_grad = True
 
 model.fc = nn.Linear(model.fc.in_features, 2)
-for param in model.fc.parameters():
-    param.requires_grad = True
+for p in model.fc.parameters():
+    p.requires_grad = True
 
 model.to(DEVICE)
 
@@ -69,13 +56,58 @@ optimizer = torch.optim.Adam(
     lr=LR
 )
 scaler = GradScaler()
-# --------------------------------------
 
 
+# ---------------- IMAGE TRAINING ----------------
+def train_on_images(cls_dir: str, label: int):
+    frames, labels = [], []
+
+    for root, _, files in os.walk(cls_dir):
+        for fname in files:
+            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                img_path = os.path.join(root, fname)
+                try:
+                    with torch.no_grad():
+                        img = Image.open(img_path).convert("RGB")
+                        frames.append(transform(img))
+                        labels.append(label)
+                except Exception:
+                    continue
+
+                if len(frames) == BATCH_SIZE:
+                    x = torch.stack(frames).pin_memory().to(DEVICE, non_blocking=True)
+                    y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
+
+                    optimizer.zero_grad()
+                    with autocast():
+                        out = model(x)
+                        loss = criterion(out, y)
+
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    frames.clear()
+                    labels.clear()
+
+    if frames:
+        x = torch.stack(frames).pin_memory().to(DEVICE, non_blocking=True)
+        y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
+
+        optimizer.zero_grad()
+        with autocast():
+            out = model(x)
+            loss = criterion(out, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+
+# ---------------- VIDEO TRAINING ----------------
 def train_on_video(video_path: str, label: int):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"Warning: cannot open video {video_path}")
         return
 
     video_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -84,8 +116,7 @@ def train_on_video(video_path: str, label: int):
 
     interval = max(int(video_fps // FPS), 1)
 
-    frames = []
-    labels = []
+    frames, labels = [], []
     frame_id = 0
 
     while True:
@@ -98,12 +129,6 @@ def train_on_video(video_path: str, label: int):
                 img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 frames.append(transform(img))
                 labels.append(label)
-
-                global REAL_COUNT, FAKE_COUNT
-                if label == 0:
-                    REAL_COUNT += 1
-                else:
-                    FAKE_COUNT += 1
 
             if len(frames) == BATCH_SIZE:
                 x = torch.stack(frames).pin_memory().to(DEVICE, non_blocking=True)
@@ -123,7 +148,6 @@ def train_on_video(video_path: str, label: int):
 
         frame_id += 1
 
-    # remaining frames
     if frames:
         x = torch.stack(frames).pin_memory().to(DEVICE, non_blocking=True)
         y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
@@ -139,53 +163,35 @@ def train_on_video(video_path: str, label: int):
 
     cap.release()
 
-def infer_label_from_path(path: str):
-    path = path.lower()
-    if "/fake/" in path or "\\fake\\" in path:
-        return 1
-    if "/real/" in path or "\\real\\" in path:
-        return 0
-    return None
 
-
+# ---------------- TRAIN LOOP ----------------
 def train():
     model.train()
 
     for epoch in range(EPOCHS):
         print(f"\nEpoch {epoch + 1}/{EPOCHS}")
 
-        found_any = False
+        for label, cls in enumerate(["real", "fake"]):
 
-        # 🔥 SINGLE FULL RECURSION
-        for root, _, files in os.walk(DATA_DIR):
-            for fname in files:
-                if not fname.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-                    continue
+            # ---- Train on images ----
+            img_dir = os.path.join(IMAGE_DIR, cls)
+            if os.path.isdir(img_dir):
+                print(f"Training on images: {img_dir}")
+                train_on_images(img_dir, label)
 
-                video_path = os.path.join(root, fname)
-                label = infer_label_from_path(video_path)
-
-                if label is None:
-                    continue  # skip files without real/fake in path
-
-                found_any = True
-                print(f"Training started: {video_path}")
-                train_on_video(video_path, label)
-
-
-        if not found_any:
-            print("WARNING: No video files found in this epoch.")
+            # ---- Train on videos ----
+            vid_dir = os.path.join(VIDEO_DIR, cls)
+            if os.path.isdir(vid_dir):
+                for root, _, files in os.walk(vid_dir):
+                    for fname in files:
+                        if fname.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+                            video_path = os.path.join(root, fname)
+                            print(f"Training on video: {video_path}")
+                            train_on_video(video_path, label)
 
         os.makedirs("models", exist_ok=True)
         torch.save(model.state_dict(), MODEL_PATH)
         print(f"Checkpoint saved after epoch {epoch + 1}")
-        print()
-        print("\n======== FINAL TRAINING STATS ========")
-        print(f"Total real frames analysed : {REAL_COUNT}")
-        print(f"Total fake frames analysed : {FAKE_COUNT}")
-        print("=====================================")
-
-
 
 
 if __name__ == "__main__":
