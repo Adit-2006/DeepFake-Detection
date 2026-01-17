@@ -1,96 +1,45 @@
-# src/temporal_utils.py
-# Improved temporal reasoning with windowing + hysteresis
+# src/image_infer.py
 
-from typing import List, Dict
-import numpy as np
+import torch
+import torch.nn.functional as F
+from torchvision.models import resnet18
+from torchvision import transforms
+from PIL import Image
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -------- Temperature parameter (learned once, fixed during inference) --------
+TEMPERATURE = 2.0   # reasonable default if not learned separately
+
+# ---------------- Model ----------------
+model = resnet18(weights="IMAGENET1K_V1")
+model.fc = torch.nn.Linear(model.fc.in_features, 2)
+model.load_state_dict(torch.load("models/image_model.pth", map_location=DEVICE))
+model.to(DEVICE)
+model.eval()
+
+# ---------------- Preprocess ----------------
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor()
+])
 
 
-def seconds_to_timestamp(sec: float) -> str:
-    m = int(sec // 60)
-    s = int(sec % 60)
-    return f"{m:02d}:{s:02d}"
-
-
-def temporal_localization(
-    frame_times: List[float],
-    frame_probs: List[float],
-    fps: int = 5,
-    window_size: int = 5,          # frames per window (~1s)
-    high_th: float = 0.7,          # enter fake
-    low_th: float = 0.4,           # exit fake
-    min_segment_sec: float = 1.0   # discard very short segments
-) -> List[Dict]:
+def infer_image(image_path: str) -> dict:
     """
-    Improved temporal reasoning:
-    - sliding window aggregation
-    - hysteresis thresholding
-    - stable segment confidence
+    Returns calibrated fake probability using temperature scaling
     """
 
-    if len(frame_probs) < window_size:
-        return []
+    image = Image.open(image_path).convert("RGB")
+    x = transform(image).unsqueeze(0).to(DEVICE)
 
-    # ---------- 1. Window-level aggregation ----------
-    windows = []
-    for i in range(0, len(frame_probs) - window_size + 1):
-        w_probs = frame_probs[i:i + window_size]
+    with torch.no_grad():
+        logits = model(x)
+        scaled_logits = logits / TEMPERATURE
+        probs = F.softmax(scaled_logits, dim=1)
 
-        # robust aggregation (median is stable against spikes)
-        score = float(np.median(w_probs))
+    fake_prob = float(probs[0][1].item())
 
-        windows.append({
-            "start": frame_times[i],
-            "end": frame_times[i + window_size - 1],
-            "score": score
-        })
-
-    # ---------- 2. Hysteresis-based segmentation ----------
-    segments = []
-    in_fake = False
-    curr_start = None
-    curr_scores = []
-
-    for w in windows:
-        if not in_fake:
-            if w["score"] >= high_th:
-                in_fake = True
-                curr_start = w["start"]
-                curr_scores = [w["score"]]
-        else:
-            if w["score"] >= low_th:
-                curr_scores.append(w["score"])
-            else:
-                # close segment
-                end_time = w["end"]
-                duration = end_time - curr_start
-
-                if duration >= min_segment_sec:
-                    segments.append({
-                        "start_time": seconds_to_timestamp(curr_start),
-                        "end_time": seconds_to_timestamp(end_time),
-                        "confidence": round(
-                            float(np.mean(np.sort(curr_scores)[-max(1, int(0.7 * len(curr_scores))):])),
-                            2
-                        )
-                    })
-
-                in_fake = False
-                curr_start = None
-                curr_scores = []
-
-    # ---------- 3. Handle open segment ----------
-    if in_fake and curr_start is not None:
-        end_time = windows[-1]["end"]
-        duration = end_time - curr_start
-
-        if duration >= min_segment_sec:
-            segments.append({
-                "start_time": seconds_to_timestamp(curr_start),
-                "end_time": seconds_to_timestamp(end_time),
-                "confidence": round(
-                    float(np.mean(np.sort(curr_scores)[-max(1, int(0.7 * len(curr_scores))):])),
-                    2
-                )
-            })
-
-    return segments
+    return {
+        "confidence": fake_prob
+    }

@@ -1,35 +1,45 @@
 # src/image_infer.py
 
 import torch
-import torchvision.transforms as T
+import torch.nn.functional as F
 from torchvision.models import resnet18
+from torchvision import transforms
 from PIL import Image
 
-# Load pretrained model
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -------- Temperature parameter (learned once, fixed during inference) --------
+TEMPERATURE = 2.0   # reasonable default if not learned separately
+
+# ---------------- Model ----------------
 model = resnet18(weights="IMAGENET1K_V1")
+model.fc = torch.nn.Linear(model.fc.in_features, 2)
+model.load_state_dict(torch.load("models/image_model.pth", map_location=DEVICE))
+model.to(DEVICE)
 model.eval()
 
-# ImageNet normalization
-transform = T.Compose([
-    T.Resize((224, 224)),
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225])
+# ---------------- Preprocess ----------------
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor()
 ])
 
+
 def infer_image(image_path: str) -> dict:
+    """
+    Returns calibrated fake probability using temperature scaling
+    """
+
     image = Image.open(image_path).convert("RGB")
-    x = transform(image).unsqueeze(0)
+    x = transform(image).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
         logits = model(x)
-        probs = torch.softmax(logits, dim=1)
+        scaled_logits = logits / TEMPERATURE
+        probs = F.softmax(scaled_logits, dim=1)
 
-    # Heuristic: treat "person-related" confidence as fake proxy
-    fake_confidence = float(1 - probs.max().item())
+    fake_prob = float(probs[0][1].item())
 
     return {
-        "input_type": "image",
-        "is_fake": fake_confidence > 0.5,
-        "confidence": round(fake_confidence, 2)
+        "confidence": fake_prob
     }
