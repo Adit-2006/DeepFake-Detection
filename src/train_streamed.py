@@ -16,7 +16,7 @@ from PIL import Image
 from torch.cuda.amp import autocast, GradScaler
 
 # ---------------- CONFIG ----------------
-DATA_DIR = "data/videos"     # data/videos/real and data/videos/fake (recursive)
+DATA_DIR = "data/"     # data/videos/ and data/images/ (recursive)
 EPOCHS = 5
 LR = 5e-5
 BATCH_SIZE = 16
@@ -25,6 +25,12 @@ INPUT_SIZE = 160
 MODEL_PATH = "models/image_model.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------------------
+
+# ---------------- STATS ----------------
+REAL_COUNT = 0
+FAKE_COUNT = 0
+# --------------------------------------
+
 
 print(f"Training on device: {DEVICE}")
 
@@ -93,6 +99,12 @@ def train_on_video(video_path: str, label: int):
                 frames.append(transform(img))
                 labels.append(label)
 
+                global REAL_COUNT, FAKE_COUNT
+                if label == 0:
+                    REAL_COUNT += 1
+                else:
+                    FAKE_COUNT += 1
+
             if len(frames) == BATCH_SIZE:
                 x = torch.stack(frames).pin_memory().to(DEVICE, non_blocking=True)
                 y = torch.tensor(labels, dtype=torch.long).to(DEVICE)
@@ -127,6 +139,14 @@ def train_on_video(video_path: str, label: int):
 
     cap.release()
 
+def infer_label_from_path(path: str):
+    path = path.lower()
+    if "/fake/" in path or "\\fake\\" in path:
+        return 1
+    if "/real/" in path or "\\real\\" in path:
+        return 0
+    return None
+
 
 def train():
     model.train()
@@ -134,22 +154,38 @@ def train():
     for epoch in range(EPOCHS):
         print(f"\nEpoch {epoch + 1}/{EPOCHS}")
 
-        for label, cls in enumerate(["real", "fake"]):
-            cls_dir = os.path.join(DATA_DIR, cls)
-            if not os.path.isdir(cls_dir):
-                continue
+        found_any = False
 
-            for root, _, files in os.walk(cls_dir):
-                for fname in files:
-                    if fname.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-                        video_path = os.path.join(root, fname)
-                        print(f"Training on: {video_path}")
-                        train_on_video(video_path, label)
+        # 🔥 SINGLE FULL RECURSION
+        for root, _, files in os.walk(DATA_DIR):
+            for fname in files:
+                if not fname.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+                    continue
 
-        # epoch checkpoint
+                video_path = os.path.join(root, fname)
+                label = infer_label_from_path(video_path)
+
+                if label is None:
+                    continue  # skip files without real/fake in path
+
+                found_any = True
+                print(f"Training started: {video_path}")
+                train_on_video(video_path, label)
+
+
+        if not found_any:
+            print("WARNING: No video files found in this epoch.")
+
         os.makedirs("models", exist_ok=True)
         torch.save(model.state_dict(), MODEL_PATH)
         print(f"Checkpoint saved after epoch {epoch + 1}")
+        print()
+        print("\n======== FINAL TRAINING STATS ========")
+        print(f"Total real frames analysed : {REAL_COUNT}")
+        print(f"Total fake frames analysed : {FAKE_COUNT}")
+        print("=====================================")
+
+
 
 
 if __name__ == "__main__":
