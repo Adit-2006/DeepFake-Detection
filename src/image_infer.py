@@ -8,8 +8,11 @@ from PIL import Image
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# -------- Temperature parameter (learned once, fixed during inference) --------
-TEMPERATURE = 2.0   # reasonable default if not learned separately
+# Temperature scaling parameter (fixed)
+TEMPERATURE = 2.0
+
+# Decision threshold for images
+IMAGE_FAKE_THRESHOLD = 0.5
 
 # ---------------- Model ----------------
 model = resnet18(weights="IMAGENET1K_V1")
@@ -27,7 +30,7 @@ transform = transforms.Compose([
 
 def infer_image(image_path: str) -> dict:
     """
-    Returns calibrated fake probability using temperature scaling
+    Image deepfake inference with calibrated confidence and decision.
     """
 
     image = Image.open(image_path).convert("RGB")
@@ -39,7 +42,10 @@ def infer_image(image_path: str) -> dict:
         probs = F.softmax(scaled_logits, dim=1)
 
     fake_prob = float(probs[0][1].item())
+    is_fake = fake_prob >= IMAGE_FAKE_THRESHOLD
 
     return {
-        "confidence": fake_prob
+        "input_type": "image",
+        "is_fake": is_fake,
+        "confidence": round(fake_prob, 3)
     }
